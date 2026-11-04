@@ -1,0 +1,5 @@
+# govengers/standards profile (README "Profiles"). Every exception names the rule and why.
+profile: library
+exceptions:
+  - rule: DES-001
+    reason: tracing.New reads the standard OTEL_* environment variables (endpoint, protocol, OTEL_SDK_DISABLED, OTEL_TRACES_EXPORTER), and the OpenTelemetry SDK and OTLP exporter it builds read the rest (headers, timeout, sampler, resource attributes). That is the OpenTelemetry configuration contract every collector deployment speaks (TRC rules); mirroring it in Options would duplicate the SDK's parsing and drift from it. Every other constructor takes all its settings through its options.
