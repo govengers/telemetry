@@ -110,7 +110,8 @@ Query values in `url.full` and `url.query` are replaced by `redacted` before the
 Use the OpenTelemetry contrib instrumentations directly; the library does not wrap them.
 
 ```go
-// Gin: otelgin before the wide-event middleware, so the span is in the context when the event begins
+// Gin: otelgin first, before the recovery and the wide-event middleware, so the span is in the
+// context when the event begins and sees the 500 of a panic
 wideEvents, err := wideeventginadapter.NewMiddleware(&wideeventginadapter.Options{
     Emitter: emitter,
     PreEnricher: func(we *wideevent.Event, ginContext *gin.Context) {
@@ -121,6 +122,7 @@ engine.Use(
     otelgin.Middleware("billing", otelgin.WithGinFilter(func(ginContext *gin.Context) bool {
         return ginContext.FullPath() != "/api/health" // probes make no traces
     })),
+    recovery, // inside the span: otelgin does not recover, so outside it a panic's span would show no error
     wideEvents,
     requestMetrics,
 )

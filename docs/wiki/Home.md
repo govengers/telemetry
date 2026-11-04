@@ -17,7 +17,7 @@ The metrics bootstrap and the tracing setup of a govengers service. The README h
 2. `tracing.New`, then `otel.SetTracerProvider` and `otel.SetTextMapPropagator(propagation.TraceContext{})`. A startup failure of `New` (an unsupported protocol) stops the boot before anything listens.
 3. `telemetry.NewRegistry`, passed to every component with metrics.
 4. Clients, pool, Redis, with their instrumentation.
-5. The Gin engine: recovery, `otelgin.Middleware`, the wide-event middleware with the `RecordTraceID` pre-enricher, `ginadapter.NewMetricsMiddleware`, the routes.
+5. The Gin engine: `otelgin.Middleware`, the recovery, the wide-event middleware with the `RecordTraceID` pre-enricher, `ginadapter.NewMetricsMiddleware`, the routes.
 6. `telemetry.NewMetricsServer` next to the API server.
 
 ## Drain sequence
@@ -29,7 +29,7 @@ The metrics bootstrap and the tracing setup of a govengers service. The README h
 
 ## Gotchas
 
-- **Middleware order.** `otelgin` must run before the wide-event middleware. The other way round, the pre-enricher sees no span and the event has no `trace.id`.
+- **Middleware order.** `otelgin` runs first. After the wide-event middleware, the pre-enricher sees no span and the event has no `trace.id`. Inside the recovery, a panicking request's span ends before the recovery writes the 500, so the trace shows no error: `otelgin` does not recover.
 - **Route templates.** Labels and span names use `ginContext.FullPath()`. A route registered with a trailing slash or matched through `RedirectTrailingSlash` is answered before any middleware.
 - **Health probes.** Skip them in all three: `SkipRoutes` (metrics), `SkipPaths` (wide events), `otelgin.WithGinFilter` (traces).
 - **Redis statements.** `redisotel` records the whole command, keys and values, unless `redisotel.WithDBStatement(false)`.
