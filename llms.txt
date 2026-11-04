@@ -5,7 +5,7 @@
 - Module: `github.com/govengers/telemetry`, Go 1.26, Apache 2.0.
 - One owner per signal: wide events are the logs, Prometheus `client_golang` the metrics, OpenTelemetry traces only. No OTel metrics or logs SDK.
 - Packages: `telemetry` (NewRegistry, NewMetricsServer, MethodLabel; imports only client_golang), `ginadapter` (NewMetricsMiddleware: `<ns>_http_requests_total{route,method,status}`, `<ns>_http_request_duration_seconds{route,method}`, `<ns>_http_requests_in_flight`), `tracing` (New, Provider.TracerProvider, Provider.Shutdown, Provider.Enabled, RecordTraceID, KeyTraceID, KeySpanID).
-- Wiring: `otel.SetTracerProvider(traces.TracerProvider())` and `otel.SetTextMapPropagator(propagation.TraceContext{})` in main; otelgin before the wide-event middleware; `PreEnricher: func(we, ginContext) { tracing.RecordTraceID(ginContext.Request.Context(), we) }`; otelhttp.NewTransport for outbound HTTP, otelpgx.NewTracer for pgx, redisotel.InstrumentTracing with WithDBStatement(false) for Redis.
+- Wiring: `otel.SetTracerProvider(traces.TracerProvider())` and `otel.SetTextMapPropagator(propagation.TraceContext{})` in main; otelgin first, outside the recovery and before the wide-event middleware; `PreEnricher: func(we, ginContext) { tracing.RecordTraceID(ginContext.Request.Context(), we) }`; otelhttp.NewTransport for outbound HTTP, otelpgx.NewTracer for pgx, redisotel.InstrumentTracing with WithDBStatement(false) for Redis.
 - Config: OTEL_EXPORTER_OTLP_ENDPOINT (or _TRACES_ENDPOINT) turns tracing on; OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none turns it off; only http/protobuf. Sampler stays ParentBased(AlwaysOn), tail sampling in the collector.
 - Standards: govengers/standards `library` profile; rules MET, TRC, LOG.
 
