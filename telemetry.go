@@ -5,7 +5,8 @@
 // Prometheus is the metrics, OpenTelemetry is used for traces only. The subpackages add the
 // rest: ginadapter records rate, errors and duration of every Gin request, tracing sets up the
 // OpenTelemetry tracer provider from the standard OTEL_* environment variables and puts the
-// trace ID on the wide event. This package imports client_golang and nothing else, so a
+// trace ID on the wide event, health serves the liveness and readiness probes, and pgxadapter
+// exports the pgx pool statistics. This package imports client_golang and nothing else, so a
 // service that only wants metrics pulls in neither Gin nor the OpenTelemetry SDK.
 //
 // The package has no global state: main builds the registry, passes it to every component
