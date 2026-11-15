@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -59,5 +60,27 @@ func TestAStuckCheckIsNotStartedAgain(t *testing.T) {
 		clock = clock.Add(DefaultCacheFor)
 		require.True(t, ready().ready)
 		require.Equal(t, int32(2), calls.Load(), "started again once the first run returned")
+	})
+}
+
+func TestACheckThatEndsThroughGoexitIsStartedAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		probes, err := New(&Options{Checks: map[string]Check{
+			"postgres": func(context.Context) error {
+				if calls.Add(1) == 1 {
+					runtime.Goexit() // what require does in a consumer's test check
+				}
+				return nil
+			},
+		}})
+		require.NoError(t, err)
+		clock := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+		probes.now = func() time.Time { return clock }
+
+		require.Equal(t, CheckTimeout, probes.evaluate(t.Context()).checks["postgres"])
+		clock = clock.Add(DefaultCacheFor)
+		require.True(t, probes.evaluate(t.Context()).ready, "the flag cleared when the first run ended")
+		require.Equal(t, int32(2), calls.Load())
 	})
 }

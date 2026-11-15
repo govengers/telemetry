@@ -66,7 +66,8 @@ type Options struct {
 	// OnCheckFailure is called with a failing check's name and error, once per evaluation, so
 	// main can record why the pod is unready; the response body carries only the check's
 	// status, never the error text. It runs after the result is published, so a panic in it
-	// fails only the probe that ran the evaluation. nil reports nothing. It must not block.
+	// fails only the probe that ran the evaluation. Two evaluations can call it at the same
+	// time, so it must be safe for concurrent use. nil reports nothing. It must not block.
 	OnCheckFailure func(name string, err error)
 }
 
@@ -227,8 +228,7 @@ func (h *Health) runChecks(ctx context.Context) (*evaluation, []checkResult) {
 			continue
 		}
 		go func() {
-			err := runRecovering(ctx, named.check)
-			named.running.Store(false)
+			err := runRecovering(ctx, named)
 			results <- checkResult{name: named.name, err: err}
 		}()
 	}
@@ -280,12 +280,15 @@ func (e *evaluation) record(finished checkResult, failures []checkResult) []chec
 }
 
 // runRecovering turns a panicking check into a failed one: the check runs in a goroutine of
-// its own, where a panic would end the process.
-func runRecovering(ctx context.Context, check Check) (err error) {
+// its own, where a panic would end the process. It clears the running flag in its deferred
+// function, so the flag also clears when the check ends through runtime.Goexit, and it clears
+// before the caller sends the result, so a directly following evaluation does not see it set.
+func runRecovering(ctx context.Context, named *namedCheck) (err error) {
 	defer func() {
+		named.running.Store(false)
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("telemetry health: check panicked: %v", recovered)
 		}
 	}()
-	return check(ctx)
+	return named.check(ctx)
 }
