@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -150,26 +151,68 @@ func TestReadinessFailsWithoutCheckingOnceDraining(t *testing.T) {
 	require.Equal(t, int32(1), calls.Load())
 }
 
+// serve runs one readiness request and returns its status code; safe off the test goroutine.
+func serve(handler http.Handler) int {
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, health.ReadinessRoute, nil))
+	return recorder.Code
+}
+
 func TestConcurrentProbesShareOneEvaluation(t *testing.T) {
-	var calls atomic.Int32
-	probes := newHealth(t, &health.Options{Checks: map[string]health.Check{
-		"postgres": func(context.Context) error { calls.Add(1); return nil },
-	}})
-	handler := probes.ReadinessHandler()
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		release := make(chan struct{})
+		probes := newHealth(t, &health.Options{Checks: map[string]health.Check{
+			"postgres": func(context.Context) error { calls.Add(1); <-release; return nil },
+		}})
+		handler := probes.ReadinessHandler()
 
-	var group sync.WaitGroup
-	for range 16 {
-		group.Go(func() {
-			recorder := httptest.NewRecorder()
-			handler.ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, health.ReadinessRoute, nil))
-			if recorder.Code != http.StatusOK {
-				t.Errorf("status %d", recorder.Code)
-			}
+		var group sync.WaitGroup
+		for range 8 {
+			group.Go(func() {
+				if code := serve(handler); code != http.StatusOK {
+					t.Errorf("status %d, want the shared evaluation's 200", code)
+				}
+			})
+		}
+		synctest.Wait() // every probe runs the evaluation or waits for it
+		close(release)
+		group.Wait()
+
+		require.Equal(t, int32(1), calls.Load())
+	})
+}
+
+func TestReadinessFailsWhenDrainingStartsDuringTheEvaluation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		probes := newHealth(t, &health.Options{Checks: map[string]health.Check{
+			"postgres": func(context.Context) error { <-release; return nil },
+		}})
+		codes := make(chan int, 1)
+		go func() { codes <- serve(probes.ReadinessHandler()) }()
+		synctest.Wait() // the probe is past the draining flag, inside the check
+
+		probes.SetDraining()
+		close(release)
+
+		require.Equal(t, http.StatusServiceUnavailable, <-codes)
+	})
+}
+
+func TestAPanickingOnCheckFailureDoesNotBlockLaterProbes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probes := newHealth(t, &health.Options{
+			Checks:         map[string]health.Check{"postgres": func(context.Context) error { return errors.New("down") }},
+			OnCheckFailure: func(string, error) { panic("logger bug") },
 		})
-	}
-	group.Wait()
+		require.PanicsWithValue(t, "logger bug", func() { serve(probes.ReadinessHandler()) })
 
-	require.Equal(t, int32(1), calls.Load(), "one evaluation inside the default cache duration")
+		got := probe(t, probes.ReadinessHandler()) // blocked forever (a synctest deadlock) before the fix
+
+		require.Equal(t, http.StatusServiceUnavailable, got.statusCode)
+		require.Equal(t, map[string]string{"postgres": health.CheckFailed}, got.checks)
+	})
 }
 
 func TestNewRejectsInvalidOptions(t *testing.T) {

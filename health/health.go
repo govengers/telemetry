@@ -28,8 +28,9 @@ const (
 )
 
 const (
-	// DefaultTimeout bounds one readiness evaluation when Options.Timeout is zero.
-	DefaultTimeout = time.Second
+	// DefaultTimeout bounds one readiness evaluation when Options.Timeout is zero. It stays
+	// below the Kubernetes default probe timeoutSeconds of 1, so the kubelet gets the 503 body.
+	DefaultTimeout = 800 * time.Millisecond
 	// DefaultCacheFor is how long a readiness result is reused when Options.CacheFor is zero.
 	DefaultCacheFor = time.Second
 )
@@ -46,7 +47,8 @@ const (
 
 // Check reports whether one dependency can serve: nil means it can. It must return when ctx
 // is done; a check that does not still counts as timed out once the readiness timeout passes,
-// but its goroutine keeps running until it returns.
+// its goroutine keeps running until it returns, and later evaluations report it as timed out
+// without starting it again until then.
 type Check func(ctx context.Context) error
 
 // Options configures New.
@@ -55,7 +57,7 @@ type Options struct {
 	// means readiness only reports draining.
 	Checks map[string]Check
 	// Timeout bounds one evaluation of all checks; zero means DefaultTimeout. Keep it below the
-	// probe's timeoutSeconds.
+	// probe's timeoutSeconds, or the kubelet times out before the 503 body arrives.
 	Timeout time.Duration
 	// CacheFor is how long an evaluation's result answers further probes; zero means
 	// DefaultCacheFor. It keeps a flood of unauthenticated probe requests from pinging the
@@ -63,13 +65,14 @@ type Options struct {
 	CacheFor time.Duration
 	// OnCheckFailure is called with a failing check's name and error, once per evaluation, so
 	// main can record why the pod is unready; the response body carries only the check's
-	// status, never the error text. nil reports nothing. It must not block.
+	// status, never the error text. It runs after the result is published, so a panic in it
+	// fails only the probe that ran the evaluation. nil reports nothing. It must not block.
 	OnCheckFailure func(name string, err error)
 }
 
 // Health holds the readiness checks and the draining flag. It is safe for concurrent use.
 type Health struct {
-	checks         []namedCheck
+	checks         []*namedCheck
 	timeout        time.Duration
 	cacheFor       time.Duration
 	onCheckFailure func(name string, err error)
@@ -82,8 +85,9 @@ type Health struct {
 }
 
 type namedCheck struct {
-	name  string
-	check Check
+	name    string
+	check   Check
+	running atomic.Bool // set while a run of check has not returned
 }
 
 // evaluation is the outcome of one run of every check.
@@ -112,7 +116,7 @@ func New(options *Options) (*Health, error) {
 		if name == "" || check == nil {
 			return nil, fmt.Errorf("telemetry health: check %q needs a name and a function", name)
 		}
-		health.checks = append(health.checks, namedCheck{name: name, check: check})
+		health.checks = append(health.checks, &namedCheck{name: name, check: check})
 	}
 	return health, nil
 }
@@ -145,6 +149,9 @@ func (h *Health) ReadinessHandler() http.Handler {
 			body = readinessBody{Status: StatusUnavailable, Checks: result.checks}
 			if result.ready {
 				body.Status = StatusReady
+			}
+			if h.draining.Load() { // SetDraining came while the checks ran
+				body = readinessBody{Status: StatusDraining}
 			}
 		}
 		statusCode := http.StatusServiceUnavailable
@@ -185,12 +192,17 @@ func (h *Health) evaluate(ctx context.Context) *evaluation {
 	h.inFlight = done
 	h.mutex.Unlock()
 
-	result := h.runChecks(context.WithoutCancel(ctx))
+	result, failures := h.runChecks(context.WithoutCancel(ctx))
 
 	h.mutex.Lock()
 	h.last, h.inFlight = result, nil
 	h.mutex.Unlock()
 	close(done)
+	if h.onCheckFailure != nil {
+		for _, failure := range failures {
+			h.onCheckFailure(failure.name, failure.err)
+		}
+	}
 	return result
 }
 
@@ -199,60 +211,72 @@ type checkResult struct {
 	err  error
 }
 
+// errStillRunning reports a check whose run from an earlier evaluation has not returned.
+var errStillRunning = fmt.Errorf("telemetry health: check still running from an earlier evaluation: %w", context.DeadlineExceeded)
+
 // runChecks runs every check in its own goroutine and collects the results until the timeout;
-// a check that has not answered by then counts as CheckTimeout.
-func (h *Health) runChecks(ctx context.Context) *evaluation {
+// a check that has not answered by then counts as CheckTimeout. It returns the failures for
+// OnCheckFailure in the order they were recorded.
+func (h *Health) runChecks(ctx context.Context) (*evaluation, []checkResult) {
 	ctx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 	results := make(chan checkResult, len(h.checks)) // buffered: a late check never blocks on send
 	for _, named := range h.checks {
-		go func() { results <- checkResult{name: named.name, err: runRecovering(ctx, named.check)} }()
+		if !named.running.CompareAndSwap(false, true) {
+			results <- checkResult{name: named.name, err: errStillRunning}
+			continue
+		}
+		go func() {
+			err := runRecovering(ctx, named.check)
+			named.running.Store(false)
+			results <- checkResult{name: named.name, err: err}
+		}()
 	}
 	result := &evaluation{checks: make(map[string]string, len(h.checks)), ready: true}
+	var failures []checkResult
 	for range h.checks {
 		select {
 		case finished := <-results:
-			result.record(finished.name, finished.err, h.onCheckFailure)
+			failures = result.record(finished, failures)
 		case <-ctx.Done():
-			result.drain(results, h.onCheckFailure)
+			failures = result.drain(results, failures)
 			for _, named := range h.checks {
 				if _, answered := result.checks[named.name]; !answered {
-					result.record(named.name, ctx.Err(), h.onCheckFailure)
+					failures = result.record(checkResult{name: named.name, err: ctx.Err()}, failures)
 				}
 			}
 			result.finishedAt = h.now()
-			return result
+			return result, failures
 		}
 	}
 	result.finishedAt = h.now()
-	return result
+	return result, failures
 }
 
 // drain records the checks that finished in the same instant the timeout fired.
-func (e *evaluation) drain(results <-chan checkResult, onCheckFailure func(string, error)) {
+func (e *evaluation) drain(results <-chan checkResult, failures []checkResult) []checkResult {
 	for {
 		select {
 		case finished := <-results:
-			e.record(finished.name, finished.err, onCheckFailure)
+			failures = e.record(finished, failures)
 		default:
-			return
+			return failures
 		}
 	}
 }
 
-func (e *evaluation) record(name string, err error, onCheckFailure func(string, error)) {
-	if err == nil {
-		e.checks[name] = CheckOK
-		return
+// record stores a check's status and appends it to failures when it did not pass.
+func (e *evaluation) record(finished checkResult, failures []checkResult) []checkResult {
+	if finished.err == nil {
+		e.checks[finished.name] = CheckOK
+		return failures
 	}
 	e.ready = false
-	e.checks[name] = CheckFailed
-	if errors.Is(err, context.DeadlineExceeded) {
-		e.checks[name] = CheckTimeout
+	e.checks[finished.name] = CheckFailed
+	if errors.Is(finished.err, context.DeadlineExceeded) {
+		e.checks[finished.name] = CheckTimeout
 	}
-	if onCheckFailure != nil {
-		onCheckFailure(name, err)
-	}
+	return append(failures, finished)
 }
 
 // runRecovering turns a panicking check into a failed one: the check runs in a goroutine of

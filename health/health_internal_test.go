@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -35,21 +37,27 @@ func TestReadinessReusesAResultForCacheFor(t *testing.T) {
 	require.Equal(t, 2, calls, "CacheFor passed")
 }
 
-func TestAProbeWaitsForTheRunningEvaluation(t *testing.T) {
-	probes, err := New(&Options{})
-	require.NoError(t, err)
-	clock := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
-	probes.now = func() time.Time { return clock }
-	running := make(chan struct{})
-	probes.inFlight = running
-	finished := &evaluation{checks: map[string]string{"postgres": CheckFailed}, finishedAt: clock}
-	results := make(chan *evaluation, 1)
+func TestAStuckCheckIsNotStartedAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		release := make(chan struct{})
+		probes, err := New(&Options{Checks: map[string]Check{
+			"postgres": func(context.Context) error { calls.Add(1); <-release; return nil }, // ignores its context
+		}})
+		require.NoError(t, err)
+		clock := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+		probes.now = func() time.Time { return clock }
+		ready := func() *evaluation { return probes.evaluate(t.Context()) }
 
-	go func() { results <- probes.evaluate(t.Context()) }()
-	probes.mutex.Lock()
-	probes.last, probes.inFlight = finished, nil
-	probes.mutex.Unlock()
-	close(running)
+		require.Equal(t, CheckTimeout, ready().checks["postgres"])
+		clock = clock.Add(DefaultCacheFor)
+		require.Equal(t, CheckTimeout, ready().checks["postgres"], "still running from the first evaluation")
+		require.Equal(t, int32(1), calls.Load(), "not started a second time")
 
-	require.Same(t, finished, <-results, "the waiting probe takes the evaluation it waited for, without running its own")
+		close(release)
+		synctest.Wait() // the first run returns
+		clock = clock.Add(DefaultCacheFor)
+		require.True(t, ready().ready)
+		require.Equal(t, int32(2), calls.Load(), "started again once the first run returned")
+	})
 }
