@@ -1,17 +1,19 @@
 //go:build e2e
 
 // Package e2e runs the documented service wiring against real collaborators: a public and an
-// internal metrics listener on TCP ports, an OTLP/HTTP receiver, and a downstream service
-// reached through otelhttp.
+// internal metrics listener on TCP ports, an OTLP/HTTP receiver, a downstream service reached
+// through otelhttp, and the health probes through the drain.
 package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +31,7 @@ import (
 
 	"github.com/govengers/telemetry"
 	"github.com/govengers/telemetry/ginadapter"
+	"github.com/govengers/telemetry/health"
 	"github.com/govengers/telemetry/internal/otlptest"
 	"github.com/govengers/telemetry/tracing"
 )
@@ -71,7 +74,9 @@ func TestServiceWiring(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", receiver.URL)
 	var downstreamTraceparent string
 	downstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		downstreamTraceparent = request.Header.Get("traceparent")
+		if request.URL.Path == "/ledger" { // the readiness check pings the root
+			downstreamTraceparent = request.Header.Get("traceparent")
+		}
 		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer downstream.Close()
@@ -82,12 +87,17 @@ func TestServiceWiring(t *testing.T) {
 	require.True(t, traces.Enabled())
 	propagator := propagation.TraceContext{}
 	registry := telemetry.NewRegistry()
-	requestMetrics, err := ginadapter.NewMetricsMiddleware(&ginadapter.MetricsOptions{Registerer: registry, Namespace: "billing", SkipRoutes: []string{"/api/health"}})
+	probeRoutes := []string{health.LivenessRoute, health.ReadinessRoute}
+	probes, err := health.New(&health.Options{Checks: map[string]health.Check{
+		"downstream": func(ctx context.Context) error { return ping(ctx, downstream.URL) },
+	}})
+	require.NoError(t, err)
+	requestMetrics, err := ginadapter.NewMetricsMiddleware(&ginadapter.MetricsOptions{Registerer: registry, Namespace: "billing", SkipRoutes: probeRoutes})
 	require.NoError(t, err)
 	logs := &lockedBuffer{}
 	wideEvents, err := wideeventginadapter.NewMiddleware(&wideeventginadapter.Options{
 		Emitter:   wideevent.NewJSONEmitter(&wideevent.JSONEmitterOptions{Writer: logs}),
-		SkipPaths: []string{"/api/health"},
+		SkipPaths: probeRoutes,
 		PreEnricher: func(we *wideevent.Event, ginContext *gin.Context) {
 			tracing.RecordTraceID(ginContext.Request.Context(), we)
 		},
@@ -101,9 +111,9 @@ func TestServiceWiring(t *testing.T) {
 	engine.Use(otelgin.Middleware("billing",
 		otelgin.WithTracerProvider(traces.TracerProvider()),
 		otelgin.WithPropagators(propagator),
-		otelgin.WithGinFilter(func(ginContext *gin.Context) bool { return ginContext.FullPath() != "/api/health" }),
+		otelgin.WithGinFilter(func(ginContext *gin.Context) bool { return !slices.Contains(probeRoutes, ginContext.FullPath()) }),
 	), wideEvents, requestMetrics)
-	engine.GET("/api/health", func(ginContext *gin.Context) { ginContext.Status(http.StatusNoContent) })
+	ginadapter.RegisterHealthRoutes(engine, probes)
 	engine.GET("/api/v1/invoices/:id", func(ginContext *gin.Context) {
 		request, err := http.NewRequestWithContext(ginContext.Request.Context(), http.MethodGet, downstream.URL+"/ledger?email=alice%40example.com", nil)
 		if err != nil {
@@ -136,11 +146,8 @@ func TestServiceWiring(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
 	require.Equal(t, http.StatusOK, response.StatusCode)
-	health, err := http.NewRequestWithContext(t.Context(), http.MethodGet, public.URL+"/api/health", nil)
-	require.NoError(t, err)
-	response, err = caller.Do(health)
-	require.NoError(t, err)
-	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusOK, get(t, caller, public.URL+health.LivenessRoute))
+	require.Equal(t, http.StatusOK, get(t, caller, public.URL+health.ReadinessRoute))
 
 	require.NoError(t, traces.Shutdown(t.Context()))
 
@@ -153,7 +160,7 @@ func TestServiceWiring(t *testing.T) {
 		require.Equal(t, hexOf(server.GetSpanId()), hexOf(outbound.GetParentSpanId()))
 		require.Equal(t, "billing", receiver.ResourceAttribute("service.name"))
 		require.Equal(t, "1.4.0", receiver.ResourceAttribute("service.version"))
-		require.Len(t, receiver.Spans(), 2, "the health route is filtered")
+		require.Len(t, receiver.Spans(), 2, "the probe routes are filtered")
 	})
 
 	t.Run("the outbound URL reaches the collector without its query values", func(t *testing.T) {
@@ -173,7 +180,7 @@ func TestServiceWiring(t *testing.T) {
 
 	t.Run("the wide event leads to the trace", func(t *testing.T) {
 		events := logs.events(t)
-		require.Len(t, events, 1, "the health route has no event")
+		require.Len(t, events, 1, "the probe routes have no event")
 		trace, isMap := events[0]["trace"].(map[string]any)
 		require.True(t, isMap, "event %v", events[0])
 		require.Equal(t, callerTraceID, trace["id"])
@@ -191,11 +198,54 @@ func TestServiceWiring(t *testing.T) {
 
 		require.Contains(t, string(body), `billing_http_requests_total{method="GET",route="/api/v1/invoices/:id",status="200"} 1`)
 		require.NotContains(t, string(body), `route="/api/health"`)
+		require.NotContains(t, string(body), `route="/api/ready"`)
 		require.Contains(t, string(body), "go_build_info")
 		problems, err := testutil.GatherAndLint(registry)
 		require.NoError(t, err)
 		require.Empty(t, problems)
 	})
+}
+
+func TestDrainFailsReadinessWhileTheServerStillServes(t *testing.T) {
+	probes, err := health.New(&health.Options{})
+	require.NoError(t, err)
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	ginadapter.RegisterHealthRoutes(engine, probes)
+	engine.GET("/api/v1/invoices/:id", func(ginContext *gin.Context) { ginContext.Status(http.StatusOK) })
+	public := httptest.NewServer(engine)
+	defer public.Close()
+	caller := &http.Client{Timeout: 5 * time.Second}
+	require.Equal(t, http.StatusOK, get(t, caller, public.URL+health.ReadinessRoute))
+
+	probes.SetDraining() // step 1 of the drain; the server keeps serving until the load balancer saw the 503
+
+	require.Equal(t, http.StatusServiceUnavailable, get(t, caller, public.URL+health.ReadinessRoute))
+	require.Equal(t, http.StatusOK, get(t, caller, public.URL+health.LivenessRoute))
+	require.Equal(t, http.StatusOK, get(t, caller, public.URL+"/api/v1/invoices/42"), "requests are still served")
+}
+
+func get(t *testing.T, client *http.Client, url string) int {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	response, err := client.Do(request)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	return response.StatusCode
+}
+
+// ping is a readiness check of an HTTP dependency.
+func ping(ctx context.Context, url string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	response, err := http.DefaultTransport.RoundTrip(request)
+	if err != nil {
+		return err
+	}
+	return response.Body.Close()
 }
 
 func spanOfKind(t *testing.T, receiver *otlptest.Receiver, kind tracev1.Span_SpanKind) *tracev1.Span {

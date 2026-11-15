@@ -1,6 +1,6 @@
 // Package ginadapter records rate, errors and duration of every Gin request on a Prometheus
-// registry the caller passes in. Mount the middleware on the engine with engine.Use, so no
-// route can miss it.
+// registry the caller passes in, and registers the health probes on a Gin engine. Mount the
+// middleware on the engine with engine.Use, so no route can miss it.
 package ginadapter
 
 import (
