@@ -8,23 +8,34 @@ govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 coverage_threshold := "80"
 coverage_excluded := "/examples/|/test/|/internal/otlptest/"
 e2e_inputs := "test/e2e"
+# Nested modules (design T11): each keeps its dependency (pgx) out of the telemetry module's go.mod
+modules := "pgxadapter"
+# Reads `go tool cover -func` output and fails below the threshold (TST-010)
+coverage_gate := "awk -v threshold=" + coverage_threshold + " '/^total:/ { found = 1; sub(\"%\", \"\", $3); print \"coverage \" $3 \"%\"; if ($3 + 0 < threshold) { print \"coverage is below \" threshold \"%\"; exit 1 } } END { if (!found) { print \"no coverage total\"; exit 1 } }'"
 
 default:
     @just --list
 
-# Vet and lint with the govengers baseline (.golangci.yml, copied from govengers/standards, LIB-005 checks enabled)
+# Vet and lint with the govengers baseline (.golangci.yml, copied from govengers/standards, LIB-005 checks enabled), the nested modules included
 lint:
     go vet ./...
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
+    for module in {{modules}}; do (cd "$module" && go vet ./... && golangci-lint run ./...); done
 
-# Unit tests of changed and affected packages; the Go test cache replays the rest (TST-014). Fails below the coverage threshold (TST-010)
-test *flags:
+# Unit tests of changed and affected packages; the Go test cache replays the rest (TST-014). Fails below the coverage threshold (TST-010).
+# Then the nested modules' tests, each module with its own coverage gate
+test *flags: && (test-modules flags)
     mkdir -p sandbox
     {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -coverprofile=sandbox/unit.raw.cover {{flags}} ./...
     grep -v -E '{{coverage_excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
-    awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
+    {{coverage_gate}} sandbox/unit.func
+
+# The nested modules' unit tests, cached by go test like the root module's; each fails below the coverage threshold
+test-modules *flags:
+    mkdir -p sandbox
+    for module in {{modules}}; do (cd "$module" && {{gotestsum}} --format testname --jsonfile "../sandbox/$module.json" -- -race -coverprofile="../sandbox/$module.cover" {{flags}} ./... && go tool cover -func="../sandbox/$module.cover" > "../sandbox/$module.func" && {{coverage_gate}} "../sandbox/$module.func"); done
 
 # Every unit test, uncached and shuffled: the nightly run and before a release (TST-014, TST-005)
 test-all: (test "-count=1" "-shuffle=on")
@@ -54,9 +65,10 @@ test-e2e: e2e-build
     mkdir -p "$passed"
     cp sandbox/e2e.json "$passed/e2e.json"
 
-# Scan for known vulnerabilities in reachable code (TCH-008)
+# Scan for known vulnerabilities in reachable code (TCH-008), the nested modules included
 vulncheck:
     {{govulncheck}} ./...
+    for module in {{modules}}; do (cd "$module" && {{govulncheck}} ./...); done
 
 # Everything CI runs on a change
 check: lint test test-e2e vulncheck

@@ -3,15 +3,15 @@ package pgxadapter_test
 import (
 	"fmt"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/govengers/telemetry"
 	"github.com/govengers/telemetry/pgxadapter"
 )
 
 func ExampleNewPoolCollector() {
-	registry := telemetry.NewRegistry() // built in main, also served by telemetry.NewMetricsServer
-	pool := &fakeStat{max: 10}          // in main: the *pgxpool.Pool
+	registry := prometheus.NewRegistry() // in main: telemetry.NewRegistry(), also served by telemetry.NewMetricsServer
+	pool := &fakeStat{max: 10}           // in main: the *pgxpool.Pool
 	_, err := pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
 		Registerer: registry,
 		Namespace:  "billing",
