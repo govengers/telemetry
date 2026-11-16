@@ -7,7 +7,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/govengers/telemetry.svg)](https://pkg.go.dev/github.com/govengers/telemetry)
 [![License](https://img.shields.io/github/license/govengers/telemetry)](LICENSE)
 
-Metrics bootstrap and tracing setup for govengers services. Module `github.com/govengers/telemetry`, Go 1.26, Apache 2.0.
+Metrics bootstrap, health probes and tracing setup for govengers services. Module `github.com/govengers/telemetry`, Go 1.26, Apache 2.0.
 
 One tool owns each signal:
 
@@ -28,10 +28,12 @@ go get github.com/govengers/telemetry
 | Package | Imports | What |
 |---|---|---|
 | `telemetry` | `client_golang` | `NewRegistry` (Go, process and build-info collectors), `NewMetricsServer` (GET `/metrics` on `:9090`, every timeout set), `MethodLabel` |
-| `telemetry/ginadapter` | Gin, `client_golang` | `NewMetricsMiddleware`: rate, errors and duration of every request by route template |
+| `telemetry/ginadapter` | Gin, `client_golang` | `NewMetricsMiddleware`: rate, errors and duration of every request by route template; `RegisterHealthRoutes` |
+| `telemetry/health` | standard library | `New`: liveness and readiness `http.Handler`s, readiness checks with timeout and short cache, `SetDraining` for the drain |
+| `telemetry/pgxadapter` | `client_golang` (not pgx) | `NewPoolCollector`: pgx pool statistics as metrics, read at scrape time |
 | `telemetry/tracing` | OpenTelemetry API, SDK, OTLP/HTTP exporter | `New` (tracer provider from `OTEL_*`, no-op without an endpoint), `RecordTraceID` (trace ID on the wide event) |
 
-A service that only wants metrics imports `telemetry` and pulls in neither Gin nor the OpenTelemetry SDK.
+A service that only wants metrics imports `telemetry` and pulls in neither Gin nor the OpenTelemetry SDK. No package imports pgx.
 
 ## Metrics
 
@@ -41,7 +43,7 @@ registry := telemetry.NewRegistry() // every component gets it as its prometheus
 requestMetrics, err := ginadapter.NewMetricsMiddleware(&ginadapter.MetricsOptions{
     Registerer: registry,
     Namespace:  "billing",
-    SkipRoutes: []string{"/api/health", "/api/ready"},
+    SkipRoutes: []string{health.LivenessRoute, health.ReadinessRoute},
 })
 if err != nil {
     return err
@@ -64,6 +66,59 @@ billing_http_requests_in_flight
 `route` is the route template (`/api/v1/invoices/:id`), or `unmatched` when no route matched, never the raw path. `method` is one of the nine standard methods or `other`. `status` is the status code; a handler that panics counts as `500` and the panic goes on to the recovery middleware. `SkipRoutes` are route templates: probes, or a socket route whose request lives as long as the socket. `Buckets` defaults to `prometheus.DefBuckets`.
 
 The metrics server serves only `GET /metrics`, in the OpenMetrics format when Prometheus asks for it, on every interface (Prometheus scrapes from inside the cluster; the Ingress never routes the port). `telemetry.MethodLabel` bounds the method label of outbound-call metrics the same way.
+
+### Pool metrics
+
+```go
+// main, after the pool is built
+_, err = pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
+    Registerer: registry,
+    Namespace:  "billing",
+    Stat:       func() pgxadapter.Stat { return pool.Stat() },
+})
+if err != nil {
+    return err
+}
+```
+
+The collector calls `Stat` once per scrape, so acquires pay nothing for the metrics:
+
+```text
+billing_db_pool_connections{state}                      acquired, idle, constructing (their sum is the pool's size)
+billing_db_pool_max_connections
+billing_db_pool_acquires_total
+billing_db_pool_acquire_duration_seconds_total
+billing_db_pool_acquire_waits_total                     acquires that waited because the pool was empty
+billing_db_pool_acquire_wait_duration_seconds_total
+billing_db_pool_canceled_acquires_total
+```
+
+`Stat` is an interface with the methods of `*pgxpool.Stat` the collector reads (pgx v5.7.3 or newer, which added `EmptyAcquireWaitTime`); the module does not depend on pgx. Saturation is `connections{state="acquired"} / max_connections`; a rising `rate(acquire_waits_total)` means requests queue for a connection.
+
+## Health probes
+
+```go
+// main, after the pool and Redis
+probes, err := health.New(&health.Options{
+    Checks: map[string]health.Check{
+        "postgres": pool.Ping,
+        "redis":    func(ctx context.Context) error { return redisClient.Ping(ctx).Err() },
+    },
+    OnCheckFailure: func(name string, err error) { logger.Warn("readiness check failed", "check", name, "error", err.Error()) },
+})
+if err != nil {
+    return err
+}
+ginadapter.RegisterHealthRoutes(engine, probes) // at the root, outside authentication
+// net/http: routes.Handle("GET "+health.ReadinessRoute, probes.ReadinessHandler())
+```
+
+| Route | Answers |
+|---|---|
+| `GET /api/health` (`health.LivenessRoute`) | always `200 ok`: the process serves HTTP. It checks no dependency, so a database outage does not restart every pod |
+| `GET /api/ready` (`health.ReadinessRoute`) | `200 {"status":"ready","checks":{"postgres":"ok"}}`; `503` with status `unavailable` and the check's `failed` or `timeout` when one fails; `503 {"status":"draining"}` after `SetDraining` |
+
+The checks run concurrently under one `Timeout` (default 800 ms, below the Kubernetes default `timeoutSeconds: 1`; a larger `Timeout` needs a larger `timeoutSeconds`, or the kubelet times out before the 503 body arrives). A check that ignores its context still counts as `timeout` when the timeout passes, and until its run returns, later evaluations report it as `timeout` without starting it again; a panicking check counts as `failed`. Concurrent probes share one evaluation and a result answers further probes for `CacheFor` (default 1 s), so a flood of requests to the unauthenticated route does not ping the database once each. The body names the checks but never carries their error text; `OnCheckFailure` gets the error; two evaluations can call it at the same time, so it must be safe for concurrent use. `SetDraining` makes readiness fail without running the checks and leaves liveness at 200; see the [drain sequence](docs/wiki/Home.md#drain-sequence).
 
 ## Tracing
 
@@ -120,7 +175,8 @@ wideEvents, err := wideeventginadapter.NewMiddleware(&wideeventginadapter.Option
 })
 engine.Use(
     otelgin.Middleware("billing", otelgin.WithGinFilter(func(ginContext *gin.Context) bool {
-        return ginContext.FullPath() != "/api/health" // probes make no traces
+        route := ginContext.FullPath() // probes make no traces
+        return route != health.LivenessRoute && route != health.ReadinessRoute
     })),
     recovery, // inside the span: otelgin does not recover, so outside it a panic's span would show no error
     wideEvents,
@@ -148,8 +204,9 @@ With the no-op provider and the propagator installed, an incoming `traceparent` 
 ## Docs
 
 - [docs/wiki/Home.md](docs/wiki/Home.md): wiring order, the drain sequence, what goes where, gotchas.
+- [docs/design.md](docs/design.md): design decisions.
 - [llms.txt](llms.txt): the short version for agents.
-- Rules: [govengers/standards](https://github.com/govengers/standards) MET (metrics), TRC (tracing), LOG (wide events).
+- Rules: [govengers/standards](https://github.com/govengers/standards) MET (metrics), TRC (tracing), LOG (wide events), LAY-003 and LAY-004 (drain, probes).
 
 ## License
 
