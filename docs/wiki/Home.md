@@ -12,14 +12,15 @@ The metrics bootstrap, the health probes and the tracing setup of a govengers se
 | From a log line to its trace? | `trace.id` on the wide event, written by `tracing.RecordTraceID` |
 | Should the kubelet restart the pod? | liveness, `health.LivenessHandler`: 200 while the process serves HTTP |
 | Should the load balancer send it traffic? | readiness, `health.ReadinessHandler`: the checks, and 503 once draining |
-| Is the database pool the bottleneck? | `pgxadapter.NewPoolCollector`: `<ns>_db_pool_*` |
+| How much database work did this request do, and did it fail? | `pgxadapter.NewTracer`: `db.queries`, `db.duration_ms`, `db.slowest_ms`, `db.failure`, `db.sqlstate` on the wide event |
+| Is the database pool the bottleneck? | `pgxadapter.NewPoolCollector`: `<ns>_db_pool_*{pool}` |
 
 ## Bootstrap order in `main`
 
 1. Configuration.
 2. `tracing.New`, then `otel.SetTracerProvider` and `otel.SetTextMapPropagator(propagation.TraceContext{})`. A startup failure of `New` (an unsupported protocol) stops the boot before anything listens.
 3. `telemetry.NewRegistry`, passed to every component with metrics.
-4. Clients, pool, Redis, with their instrumentation; `pgxadapter.NewPoolCollector` on the registry right after the pool.
+4. Clients, pool, Redis, with their instrumentation: `poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())` before the pool is built, `pgxadapter.NewPoolCollector` on the registry right after it, one per pool with its own `Name`.
 5. `health.New` with a check per dependency the pod cannot serve without (`pool.Ping`, the Redis ping).
 6. The Gin engine: `otelgin.Middleware`, the recovery, the wide-event middleware with the `RecordTraceID` pre-enricher, `ginadapter.NewMetricsMiddleware`, then `ginadapter.RegisterHealthRoutes` at the root before the authentication middleware, then the routes.
 7. `telemetry.NewMetricsServer` next to the API server.
@@ -54,7 +55,10 @@ err := errors.Join(apiServer.Shutdown(shutdownContext), metricsServer.Shutdown(s
 - **Probe timeout.** The probe's `timeoutSeconds` must stay above `Timeout` (default 800 ms against the Kubernetes default of 1 s). With `Timeout: 2 * time.Second` set `timeoutSeconds: 3`, or a hung database shows up in the kubelet's events as a client timeout instead of the 503 body naming the check.
 - **Liveness checks nothing.** A liveness probe that pings the database restarts every pod during a database outage, and the restarts make the recovery slower.
 - **Readiness body.** It is unauthenticated, so it names the checks and never carries their errors (hostnames, addresses). Record the error through `OnCheckFailure`, which runs once per evaluation, not once per probe, and can run in two evaluations at the same time.
-- **Pool metrics need pgx v5.7.3 or newer.** `pgxadapter.Stat` includes `EmptyAcquireWaitTime`; an older `*pgxpool.Stat` does not satisfy it and the closure in main does not compile.
+- **pgxadapter is a module of its own.** `go get github.com/govengers/telemetry/pgxadapter`; it is tagged `pgxadapter/vX.Y.Z` and requires pgx v5.12.0 or newer.
+- **The database fields need the event in the statement's context.** The Gin middleware and the jobs middleware put it there; a repository that runs its statements with `context.Background()` or a context it built itself records nothing. Work detached with `context.WithoutCancel` keeps the event, and its statements that end after the event was emitted are dropped.
+- **One tracer, several pools.** The fields add up every pool's statements of a unit of work. The pool label separates only the pool metrics.
+- **db.duration_ms is not wall time.** It is the sum of the statements' times: statements run concurrently add up, and a query's time includes reading its rows until `Close`.
 - **Redis statements.** `redisotel` records the whole command, keys and values, unless `redisotel.WithDBStatement(false)`.
 - **No OpenTelemetry meter provider.** The contrib instrumentations record OpenTelemetry metrics through the global meter provider; leaving it unset keeps them off. Prometheus is the metrics pipeline.
 - **Module family.** Bump `go.opentelemetry.io/otel`, `otel/sdk`, `otel/trace` and the OTLP exporters to one minor together, and the `contrib` instrumentations to the release that matches it. The `otel/log` modules are on their own v0 line; this library does not use them.
