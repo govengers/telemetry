@@ -7,6 +7,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"weak"
 
@@ -71,8 +72,14 @@ type unitOfWork struct {
 	failed  bool
 }
 
-// startKey is the context key of a call's start time, set by the Trace*Start methods.
-type startKey struct{}
+// call is one traced call, put into its context by the Trace*Start methods.
+type call struct {
+	start time.Time
+	ended atomic.Bool // pgx ends a batch that fails early twice: in SendBatch and in Close
+}
+
+// callKey is the context key of the call.
+type callKey struct{}
 
 var (
 	_ pgx.QueryTracer    = (*Tracer)(nil)
@@ -125,16 +132,17 @@ func (t *Tracer) start(ctx context.Context) context.Context {
 	if wideevent.FromContext(ctx) == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, startKey{}, t.now())
+	return context.WithValue(ctx, callKey{}, &call{start: t.now()})
 }
 
-// elapsed is the time since the call's start, or 0 when the start was not recorded.
+// elapsed is the time since the call's start on its first end, and 0 on a later end or when the
+// start was not recorded, so a call that ends twice adds its time once.
 func (t *Tracer) elapsed(ctx context.Context) time.Duration {
-	started, ok := ctx.Value(startKey{}).(time.Time)
-	if !ok {
+	traced, ok := ctx.Value(callKey{}).(*call)
+	if !ok || traced.ended.Swap(true) {
 		return 0
 	}
-	return t.now().Sub(started)
+	return t.now().Sub(traced.start)
 }
 
 // record adds a call to the unit of work's totals and writes them to its event. The unit's mutex

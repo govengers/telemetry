@@ -99,6 +99,25 @@ func TestTracerCountsEachStatementOfABatchAndTimesTheBatchOnce(t *testing.T) {
 	require.Equal(t, 4*time.Millisecond, fields[KeySlowest])
 }
 
+func TestABatchThatEndsTwiceAddsItsTimeOnce(t *testing.T) {
+	tracer, clock := newClockedTracer()
+	ctx, we := newUnitOfWork(t)
+	failure := &pgconn.PgError{Code: "42P01"}
+
+	// pgx ends a batch that fails before its first result in SendBatch and again in Close
+	batch := tracer.TraceBatchStart(ctx, nil, pgx.TraceBatchStartData{})
+	clock.advance(2 * time.Millisecond)
+	tracer.TraceBatchEnd(batch, nil, pgx.TraceBatchEndData{Err: failure})
+	clock.advance(9 * time.Millisecond)
+	tracer.TraceBatchEnd(batch, nil, pgx.TraceBatchEndData{Err: failure})
+
+	fields := fieldsOf(we)
+	require.Equal(t, 0, fields[KeyQueries])
+	require.Equal(t, 2*time.Millisecond, fields[KeyDuration])
+	require.Equal(t, 2*time.Millisecond, fields[KeySlowest])
+	require.Equal(t, "42P01", fields[KeySQLState])
+}
+
 func TestTracerCountsACopyFromAsOneStatement(t *testing.T) {
 	tracer, clock := newClockedTracer()
 	ctx, we := newUnitOfWork(t)
