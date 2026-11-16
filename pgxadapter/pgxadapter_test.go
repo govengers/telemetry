@@ -34,7 +34,7 @@ func TestPoolCollectorReadsTheStatAtScrapeTime(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	stat := &fakeStat{}
 	_, err := pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
-		Registerer: registry, Namespace: "billing", Stat: func() pgxadapter.Stat { return stat },
+		Registerer: registry, Namespace: "billing", Name: "main", Stat: func() pgxadapter.Stat { return stat },
 	})
 	require.NoError(t, err)
 
@@ -47,27 +47,27 @@ func TestPoolCollectorReadsTheStatAtScrapeTime(t *testing.T) {
 	require.NoError(t, testutil.GatherAndCompare(registry, strings.NewReader(`
 # HELP billing_db_pool_acquire_duration_seconds_total Time spent in successful acquires from the pool.
 # TYPE billing_db_pool_acquire_duration_seconds_total counter
-billing_db_pool_acquire_duration_seconds_total 1.5
+billing_db_pool_acquire_duration_seconds_total{pool="main"} 1.5
 # HELP billing_db_pool_acquire_wait_duration_seconds_total Time successful acquires waited because the pool was empty.
 # TYPE billing_db_pool_acquire_wait_duration_seconds_total counter
-billing_db_pool_acquire_wait_duration_seconds_total 0.25
+billing_db_pool_acquire_wait_duration_seconds_total{pool="main"} 0.25
 # HELP billing_db_pool_acquire_waits_total Successful acquires that waited because the pool was empty.
 # TYPE billing_db_pool_acquire_waits_total counter
-billing_db_pool_acquire_waits_total 7
+billing_db_pool_acquire_waits_total{pool="main"} 7
 # HELP billing_db_pool_acquires_total Successful acquires from the pool.
 # TYPE billing_db_pool_acquires_total counter
-billing_db_pool_acquires_total 120
+billing_db_pool_acquires_total{pool="main"} 120
 # HELP billing_db_pool_canceled_acquires_total Acquires canceled by their context.
 # TYPE billing_db_pool_canceled_acquires_total counter
-billing_db_pool_canceled_acquires_total 2
+billing_db_pool_canceled_acquires_total{pool="main"} 2
 # HELP billing_db_pool_connections Connections in the pool by state.
 # TYPE billing_db_pool_connections gauge
-billing_db_pool_connections{state="acquired"} 3
-billing_db_pool_connections{state="constructing"} 1
-billing_db_pool_connections{state="idle"} 5
+billing_db_pool_connections{pool="main",state="acquired"} 3
+billing_db_pool_connections{pool="main",state="constructing"} 1
+billing_db_pool_connections{pool="main",state="idle"} 5
 # HELP billing_db_pool_max_connections Maximum size of the pool.
 # TYPE billing_db_pool_max_connections gauge
-billing_db_pool_max_connections 10
+billing_db_pool_max_connections{pool="main"} 10
 `)))
 	problems, err := testutil.GatherAndLint(registry)
 	require.NoError(t, err)
@@ -77,7 +77,7 @@ billing_db_pool_max_connections 10
 func TestPoolCollectorSendsNothingWithoutAStat(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	_, err := pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
-		Registerer: registry, Namespace: "billing", Stat: func() pgxadapter.Stat { return nil },
+		Registerer: registry, Namespace: "billing", Name: "main", Stat: func() pgxadapter.Stat { return nil },
 	})
 	require.NoError(t, err)
 
@@ -91,9 +91,10 @@ func TestNewPoolCollectorRejectsInvalidOptions(t *testing.T) {
 	stat := func() pgxadapter.Stat { return &fakeStat{} }
 	for name, options := range map[string]*pgxadapter.PoolOptions{
 		"nil options":   nil,
-		"no registerer": {Namespace: "billing", Stat: stat},
-		"no namespace":  {Registerer: prometheus.NewRegistry(), Stat: stat},
-		"no stat":       {Registerer: prometheus.NewRegistry(), Namespace: "billing"},
+		"no registerer": {Namespace: "billing", Name: "main", Stat: stat},
+		"no namespace":  {Registerer: prometheus.NewRegistry(), Name: "main", Stat: stat},
+		"no name":       {Registerer: prometheus.NewRegistry(), Namespace: "billing", Stat: stat},
+		"no stat":       {Registerer: prometheus.NewRegistry(), Namespace: "billing", Name: "main"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			collector, err := pgxadapter.NewPoolCollector(options)
@@ -104,9 +105,26 @@ func TestNewPoolCollectorRejectsInvalidOptions(t *testing.T) {
 	}
 }
 
-func TestASecondPoolUnderTheSameNamespaceFailsToRegister(t *testing.T) {
+func TestTwoPoolsOfOneServiceRegisterSideBySide(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	options := &pgxadapter.PoolOptions{Registerer: registry, Namespace: "billing", Stat: func() pgxadapter.Stat { return &fakeStat{} }}
+	for name, size := range map[string]int32{"main": 10, "replica": 4} {
+		_, err := pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
+			Registerer: registry, Namespace: "billing", Name: name, Stat: func() pgxadapter.Stat { return &fakeStat{max: size} },
+		})
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, testutil.GatherAndCompare(registry, strings.NewReader(`
+# HELP billing_db_pool_max_connections Maximum size of the pool.
+# TYPE billing_db_pool_max_connections gauge
+billing_db_pool_max_connections{pool="main"} 10
+billing_db_pool_max_connections{pool="replica"} 4
+`), "billing_db_pool_max_connections"))
+}
+
+func TestThePoolNameTwiceUnderOneNamespaceFailsToRegister(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	options := &pgxadapter.PoolOptions{Registerer: registry, Namespace: "billing", Name: "main", Stat: func() pgxadapter.Stat { return &fakeStat{} }}
 	_, err := pgxadapter.NewPoolCollector(options)
 	require.NoError(t, err)
 

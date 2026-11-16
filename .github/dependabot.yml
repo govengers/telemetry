@@ -3,7 +3,7 @@
 version: 2
 updates:
   - package-ecosystem: gomod
-    directory: /
+    directories: [/, /pgxadapter] # the nested modules (design T11) have their own go.mod
     schedule:
       interval: weekly
   - package-ecosystem: github-actions
