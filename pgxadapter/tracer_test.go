@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/multitracer"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/telemetry/pgxadapter"
@@ -120,8 +121,9 @@ func TestTracerComposesWithAnotherTracerThroughMultitracer(t *testing.T) {
 }
 
 // fakeServer answers pgx over an in-memory pipe in the simple query protocol: "fail" gets a unique
-// violation, any other statement one row with the value 1. It is enough to run pgx's real call
-// paths without a PostgreSQL server.
+// violation, any other statement one row with the value 1. A prepare (Parse, Describe, Sync) gets
+// an undefined table, like the schema lookup of a CopyFrom into a table that does not exist. It is
+// enough to run pgx's real call paths without a PostgreSQL server.
 func fakeServer(t *testing.T, conn net.Conn) {
 	t.Helper()
 	backend := pgproto3.NewBackend(conn, conn)
@@ -137,25 +139,29 @@ func fakeServer(t *testing.T, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		query, ok := message.(*pgproto3.Query)
-		if !ok {
+		switch message := message.(type) {
+		case *pgproto3.Parse, *pgproto3.Describe: // answered at the Sync
+			continue
+		case *pgproto3.Sync:
+			backend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation does not exist"})
+		case *pgproto3.Query:
+			if strings.Contains(message.String, "fail") {
+				backend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "23505", Message: "duplicate key value violates unique constraint"})
+			} else {
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("n"), DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1}}})
+				backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("1")}})
+				backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+			}
+		default:
 			return // Terminate
-		}
-		if strings.Contains(query.String, "fail") {
-			backend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "23505", Message: "duplicate key value violates unique constraint"})
-		} else {
-			backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("n"), DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1}}})
-			backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("1")}})
-			backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
 		}
 		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	}
 }
 
-func connectToFakeServer(t *testing.T, tracer pgx.QueryTracer) *pgx.Conn {
+// useFakeServer points config at fakeServer and installs tracer.
+func useFakeServer(t *testing.T, config *pgx.ConnConfig, tracer pgx.QueryTracer) {
 	t.Helper()
-	config, err := pgx.ParseConfig("postgres://test@fake/test?sslmode=disable")
-	require.NoError(t, err)
 	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	config.Tracer = tracer
 	config.LookupFunc = func(_ context.Context, host string) ([]string, error) { return []string{host}, nil }
@@ -164,6 +170,15 @@ func connectToFakeServer(t *testing.T, tracer pgx.QueryTracer) *pgx.Conn {
 		go fakeServer(t, server)
 		return client, nil
 	}
+}
+
+const fakeServerURL = "postgres://test@fake/test?sslmode=disable"
+
+func connectToFakeServer(t *testing.T, tracer pgx.QueryTracer) *pgx.Conn {
+	t.Helper()
+	config, err := pgx.ParseConfig(fakeServerURL)
+	require.NoError(t, err)
+	useFakeServer(t, config, tracer)
 	conn, err := pgx.ConnectConfig(t.Context(), config)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close(context.Background())) })
@@ -195,4 +210,50 @@ func TestTracerRecordsPgxStatementsOnTheWideEvent(t *testing.T) {
 	require.IsType(t, time.Duration(0), fields[pgxadapter.KeyDuration])
 	require.IsType(t, time.Duration(0), fields[pgxadapter.KeySlowest])
 	require.GreaterOrEqual(t, fields[pgxadapter.KeyDuration], fields[pgxadapter.KeySlowest])
+}
+
+func TestACopyFromWhosePrepareFailsCountsWithItsFailure(t *testing.T) {
+	conn := connectToFakeServer(t, multitracer.New(&contextTracer{}, pgxadapter.NewTracer()))
+	ctx, we := newUnitOfWork(t.Context())
+
+	// pgx looks up the table's columns with a prepare and returns on its failure without ending the CopyFrom
+	_, err := conn.CopyFrom(ctx, pgx.Identifier{"missing"}, []string{"id"}, pgx.CopyFromRows([][]any{{1}}))
+
+	require.Error(t, err)
+	fields := fieldsOf(we)
+	require.Equal(t, 1, fields[pgxadapter.KeyQueries])
+	require.Equal(t, pgxadapter.FailureServer, fields[pgxadapter.KeyFailure])
+	require.Equal(t, "42P01", fields[pgxadapter.KeySQLState])
+}
+
+func TestAFailedPoolAcquireRecordsItsFailure(t *testing.T) {
+	config, err := pgxpool.ParseConfig(fakeServerURL)
+	require.NoError(t, err)
+	useFakeServer(t, config.ConnConfig, multitracer.New(&contextTracer{}, pgxadapter.NewTracer()))
+	pool, err := pgxpool.NewWithConfig(t.Context(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Unix(0, 0))
+	defer cancelExpired()
+
+	for name, test := range map[string]struct {
+		ctx     context.Context //nolint:containedctx // a table of test cases
+		failure string
+	}{
+		"context already canceled":   {canceled, pgxadapter.FailureCanceled},
+		"deadline passed in waiting": {expired, pgxadapter.FailureTimeout},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, we := newUnitOfWork(test.ctx)
+
+			_, err := pool.Exec(ctx, "select 1")
+
+			require.Error(t, err)
+			fields := fieldsOf(we)
+			require.Equal(t, test.failure, fields[pgxadapter.KeyFailure])
+			require.Equal(t, 0, fields[pgxadapter.KeyQueries], "no statement ran")
+		})
+	}
 }

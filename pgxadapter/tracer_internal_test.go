@@ -11,6 +11,7 @@ import (
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -130,6 +131,49 @@ func TestTracerCountsACopyFromAsOneStatement(t *testing.T) {
 	require.Equal(t, 1, fields[KeyQueries])
 	require.Equal(t, 7*time.Millisecond, fields[KeyDuration])
 	require.Equal(t, 7*time.Millisecond, fields[KeySlowest])
+}
+
+func TestACopyFromEndsOnceWhenItsPrepareFails(t *testing.T) {
+	tracer, clock := newClockedTracer()
+	ctx, we := newUnitOfWork(t)
+	failure := &pgconn.PgError{Code: "42P01"}
+
+	copying := tracer.TraceCopyFromStart(ctx, nil, pgx.TraceCopyFromStartData{})
+	prepare := tracer.TracePrepareStart(copying, nil, pgx.TracePrepareStartData{})
+	clock.advance(4 * time.Millisecond)
+	tracer.TracePrepareEnd(prepare, nil, pgx.TracePrepareEndData{Err: failure})
+	tracer.TraceCopyFromEnd(copying, nil, pgx.TraceCopyFromEndData{Err: failure}) // should pgx ever end it too
+
+	fields := fieldsOf(we)
+	require.Equal(t, 1, fields[KeyQueries])
+	require.Equal(t, 4*time.Millisecond, fields[KeyDuration])
+	require.Equal(t, "42P01", fields[KeySQLState])
+}
+
+func TestAPrepareOutsideACopyFromRecordsNothing(t *testing.T) {
+	tracer, _ := newClockedTracer()
+	ctx, we := newUnitOfWork(t)
+
+	query := tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{})
+	for _, prepareContext := range []context.Context{ctx, query} {
+		prepare := tracer.TracePrepareStart(prepareContext, nil, pgx.TracePrepareStartData{})
+		tracer.TracePrepareEnd(prepare, nil, pgx.TracePrepareEndData{Err: errors.New("prepare failed")})
+	}
+	copying := tracer.TraceCopyFromStart(ctx, nil, pgx.TraceCopyFromStartData{})
+	tracer.TracePrepareEnd(tracer.TracePrepareStart(copying, nil, pgx.TracePrepareStartData{}), nil, pgx.TracePrepareEndData{})
+
+	fields := fieldsOf(we)
+	require.NotContains(t, fields, KeyQueries, "the query ends on its own; a successful prepare ends nothing")
+	require.NotContains(t, fields, KeyFailure)
+}
+
+func TestASuccessfulPoolAcquireRecordsNothing(t *testing.T) {
+	tracer, _ := newClockedTracer()
+	ctx, we := newUnitOfWork(t)
+
+	tracer.TraceAcquireEnd(tracer.TraceAcquireStart(ctx, nil, pgxpool.TraceAcquireStartData{}), nil, pgxpool.TraceAcquireEndData{})
+
+	require.NotContains(t, fieldsOf(we), KeyFailure)
 }
 
 func TestTracerKeepsTheFirstFailure(t *testing.T) {

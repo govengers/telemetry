@@ -14,6 +14,7 @@ import (
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The wide-event fields the Tracer writes (standards LOG-004, namespace db). The Tracer owns
@@ -22,7 +23,7 @@ const (
 	KeyQueries  = "db.queries"     // int: statements run, each statement of a batch and each CopyFrom counted
 	KeyDuration = "db.duration_ms" // duration: the sum of the statements' times, written in milliseconds
 	KeySlowest  = "db.slowest_ms"  // duration: the longest single call (statement, whole batch, CopyFrom)
-	KeyFailure  = "db.failure"     // string: the class of the first failed statement, one of the Failure values
+	KeyFailure  = "db.failure"     // string: the class of the first failure (statement or pool acquire), one of the Failure values
 	KeySQLState = "db.sqlstate"    // string: the SQLSTATE of that failure, when the server reported it
 )
 
@@ -32,7 +33,7 @@ const (
 	FailureCanceled   = "canceled"   // the statement's context was canceled
 	FailureTimeout    = "timeout"    // the statement's context deadline passed, or a network timeout
 	FailureConnection = "connection" // the connection broke or was closed
-	FailureServer     = "server"     // the server rejected the statement; KeySQLState holds its code
+	FailureServer     = "server"     // the server rejected the statement or ended the session (57P01 on a failover); KeySQLState holds its code
 	FailureClient     = "client"     // pgx failed on this side: encoding an argument, scanning a row
 )
 
@@ -45,19 +46,27 @@ const sqlStateQueryCanceled = "57014"
 // and the class of the first failure. It never records SQL text or arguments. Statements
 // without a wide event in their context (migrations, startup) record nothing.
 //
-// Tracer implements pgx.QueryTracer, pgx.BatchTracer and pgx.CopyFromTracer. Install it on the
-// pool's connection config, next to otelpgx through pgx's multitracer:
+// Tracer implements pgx.QueryTracer, pgx.BatchTracer, pgx.CopyFromTracer, pgx.PrepareTracer and
+// pgxpool.AcquireTracer. Build one Tracer in main and install the same one on every pool's
+// connection config, next to otelpgx through pgx's multitracer:
 //
-//	poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())
+//	tracer := pgxadapter.NewTracer()
+//	poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), tracer)
+//
+// The totals of a unit of work live in the Tracer, so two Tracers do not add up: the one whose
+// statement ends last overwrites the other's totals on the event.
 //
 // A statement's time runs from the call to its end: for Query until the rows are closed, so it
 // includes reading the rows; the implicit prepare of pgx's statement cache is part of it, waiting
 // for a pool connection is not (the pool metrics show that). Statements that run concurrently in
 // one unit of work add up, so the total can exceed the unit of work's duration. A batch counts
-// each of its statements and is timed as one call. Statements that end after the event was
-// emitted are dropped (the event is frozen).
+// each of its statements and is timed as one call, from SendBatch to Close: PostgreSQL sends a
+// batch's results together at its end, so no statement of it has a time of its own. A failed
+// pool acquire (pool exhausted until the deadline, connection refused, context
+// already ended) records the failure without counting a statement. Statements that end after the
+// event was emitted are dropped (the event is frozen).
 //
-// A Tracer is safe for concurrent use; one Tracer serves every pool of the process.
+// A Tracer is safe for concurrent use.
 type Tracer struct {
 	units sync.Map // weak.Pointer[wideevent.Event] -> *unitOfWork, removed when the event is collected
 	now   func() time.Time
@@ -74,17 +83,20 @@ type unitOfWork struct {
 
 // call is one traced call, put into its context by the Trace*Start methods.
 type call struct {
-	start time.Time
-	ended atomic.Bool // pgx ends a batch that fails early twice: in SendBatch and in Close
+	start    time.Time
+	copyFrom bool        // pgx does not end a CopyFrom whose implicit prepare fails; TracePrepareEnd does
+	ended    atomic.Bool // pgx ends a batch that fails early twice: in SendBatch and in Close
 }
 
 // callKey is the context key of the call.
 type callKey struct{}
 
 var (
-	_ pgx.QueryTracer    = (*Tracer)(nil)
-	_ pgx.BatchTracer    = (*Tracer)(nil)
-	_ pgx.CopyFromTracer = (*Tracer)(nil)
+	_ pgx.QueryTracer       = (*Tracer)(nil)
+	_ pgx.BatchTracer       = (*Tracer)(nil)
+	_ pgx.CopyFromTracer    = (*Tracer)(nil)
+	_ pgx.PrepareTracer     = (*Tracer)(nil)
+	_ pgxpool.AcquireTracer = (*Tracer)(nil)
 )
 
 // NewTracer returns a Tracer.
@@ -94,17 +106,18 @@ func NewTracer() *Tracer {
 
 // TraceQueryStart implements pgx.QueryTracer.
 func (t *Tracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
-	return t.start(ctx)
+	return t.start(ctx, false)
 }
 
 // TraceQueryEnd implements pgx.QueryTracer.
 func (t *Tracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
-	t.record(ctx, 1, t.elapsed(ctx), data.Err)
+	elapsed, _ := t.end(ctx)
+	t.record(ctx, 1, elapsed, data.Err)
 }
 
 // TraceBatchStart implements pgx.BatchTracer.
 func (t *Tracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceBatchStartData) context.Context {
-	return t.start(ctx)
+	return t.start(ctx, false)
 }
 
 // TraceBatchQuery implements pgx.BatchTracer: it counts the statement; the batch's time is
@@ -115,34 +128,73 @@ func (t *Tracer) TraceBatchQuery(ctx context.Context, _ *pgx.Conn, data pgx.Trac
 
 // TraceBatchEnd implements pgx.BatchTracer.
 func (t *Tracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchEndData) {
-	t.record(ctx, 0, t.elapsed(ctx), data.Err)
+	elapsed, _ := t.end(ctx)
+	t.record(ctx, 0, elapsed, data.Err)
 }
 
 // TraceCopyFromStart implements pgx.CopyFromTracer.
 func (t *Tracer) TraceCopyFromStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceCopyFromStartData) context.Context {
-	return t.start(ctx)
+	return t.start(ctx, true)
 }
 
 // TraceCopyFromEnd implements pgx.CopyFromTracer.
 func (t *Tracer) TraceCopyFromEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceCopyFromEndData) {
-	t.record(ctx, 1, t.elapsed(ctx), data.Err)
+	t.endCopyFrom(ctx, data.Err)
 }
 
-func (t *Tracer) start(ctx context.Context) context.Context {
+// TracePrepareStart implements pgx.PrepareTracer.
+func (t *Tracer) TracePrepareStart(ctx context.Context, _ *pgx.Conn, _ pgx.TracePrepareStartData) context.Context {
+	return ctx
+}
+
+// TracePrepareEnd implements pgx.PrepareTracer. Only a failed prepare inside a CopyFrom records
+// anything: pgx returns from such a CopyFrom without calling TraceCopyFromEnd. Any other prepare
+// is part of the statement that triggered it, or not a statement.
+func (t *Tracer) TracePrepareEnd(ctx context.Context, _ *pgx.Conn, data pgx.TracePrepareEndData) {
+	if traced, ok := ctx.Value(callKey{}).(*call); ok && traced.copyFrom && data.Err != nil {
+		t.endCopyFrom(ctx, data.Err)
+	}
+}
+
+// TraceAcquireStart implements pgxpool.AcquireTracer.
+func (t *Tracer) TraceAcquireStart(ctx context.Context, _ *pgxpool.Pool, _ pgxpool.TraceAcquireStartData) context.Context {
+	return ctx
+}
+
+// TraceAcquireEnd implements pgxpool.AcquireTracer: a failed acquire records its failure, so a
+// request that never got a connection does not look like one that never used the database.
+func (t *Tracer) TraceAcquireEnd(ctx context.Context, _ *pgxpool.Pool, data pgxpool.TraceAcquireEndData) {
+	if data.Err != nil {
+		t.record(ctx, 0, 0, data.Err)
+	}
+}
+
+func (t *Tracer) start(ctx context.Context, copyFrom bool) context.Context {
 	if wideevent.FromContext(ctx) == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, callKey{}, &call{start: t.now()})
+	return context.WithValue(ctx, callKey{}, &call{start: t.now(), copyFrom: copyFrom})
 }
 
-// elapsed is the time since the call's start on its first end, and 0 on a later end or when the
-// start was not recorded, so a call that ends twice adds its time once.
-func (t *Tracer) elapsed(ctx context.Context) time.Duration {
+// end returns the time since the call's start and true on its first end, and false on a later
+// end, so a call that ends twice adds its time once. Without a recorded start the time is 0.
+func (t *Tracer) end(ctx context.Context) (time.Duration, bool) {
 	traced, ok := ctx.Value(callKey{}).(*call)
-	if !ok || traced.ended.Swap(true) {
-		return 0
+	if !ok {
+		return 0, true
 	}
-	return t.now().Sub(traced.start)
+	if traced.ended.Swap(true) {
+		return 0, false
+	}
+	return t.now().Sub(traced.start), true
+}
+
+// endCopyFrom records a CopyFrom once, whether it ends in TraceCopyFromEnd or in a failed prepare.
+func (t *Tracer) endCopyFrom(ctx context.Context, err error) {
+	elapsed, first := t.end(ctx)
+	if first {
+		t.record(ctx, 1, elapsed, err)
+	}
 }
 
 // record adds a call to the unit of work's totals and writes them to its event. The unit's mutex
