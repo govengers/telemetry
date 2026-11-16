@@ -100,8 +100,9 @@ billing_db_pool_canceled_acquires_total
 ## Database work on the wide event
 
 ```go
-// main, before the pool is built
-poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer()) // github.com/jackc/pgx/v5/multitracer
+// main, once, before the pools are built; every pool gets the same tracer
+tracer := pgxadapter.NewTracer()
+poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), tracer) // github.com/jackc/pgx/v5/multitracer
 pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 ```
 
@@ -111,11 +112,11 @@ Every statement run with a context that carries a wide event (`wideevent.FromCon
 |---|---|
 | `db.queries` | statements run: each `Exec`, `Query`, `QueryRow`, each statement of a batch, each `CopyFrom`; `begin` and `commit` count too |
 | `db.duration_ms` | the sum of their times, in milliseconds |
-| `db.slowest_ms` | the longest single call; a batch is timed as one call |
-| `db.failure` | the class of the first failed statement: `canceled`, `timeout`, `connection`, `server`, `client` |
+| `db.slowest_ms` | the longest single call; a batch is timed as one call, because PostgreSQL sends a batch's results together at its end |
+| `db.failure` | the class of the first failure of a statement or of acquiring a pool connection: `canceled`, `timeout`, `connection`, `server`, `client` |
 | `db.sqlstate` | the SQLSTATE of that failure when the server rejected it (`23505` for a unique violation) |
 
-No SQL text, arguments or error text: a server error's text carries the values of the failed row. A statement's time ends when its rows are closed, so it includes reading them; waiting for a pool connection is not part of it (the pool metrics show that). Statements that run concurrently add up. Statements outside a unit of work (migrations, startup) record nothing, and those that end after the event was emitted are dropped. The keys are constants (`pgxadapter.KeyQueries`, ...); the tracer owns them, a repository writes its own `db.*` fields next to them (`db.operation`, `db.tx`).
+Build one tracer and give it to every pool: the totals of a unit of work live in the tracer, so with a second tracer the pool whose statement ends last overwrites the other pool's totals. A pool acquire that fails (pool exhausted until the deadline, connection refused, context already ended) sets `db.failure` without counting a statement, so such a request does not look like one that never used the database. No SQL text, arguments or error text: a server error's text carries the values of the failed row. A statement's time ends when its rows are closed, so it includes reading them; waiting for a pool connection is not part of it (the pool metrics show that). Statements that run concurrently add up. Statements outside a unit of work (migrations, startup) record nothing, and those that end after the event was emitted are dropped. The keys are constants (`pgxadapter.KeyQueries`, ...); the tracer owns them, a repository writes its own `db.*` fields next to them (`db.operation`, `db.tx`).
 
 ## Health probes
 
@@ -209,7 +210,7 @@ engine.Use(
 client := &http.Client{Timeout: 10 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport)}
 
 // pgx: parameterized SQL, never the parameters (otelpgx leaves them out by default), next to the wide-event tracer
-poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())
+poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), tracer) // tracer := pgxadapter.NewTracer(), one for every pool
 
 // Redis: without the command text, which holds the keys and values
 err = redisotel.InstrumentTracing(redisClient, redisotel.WithDBStatement(false))

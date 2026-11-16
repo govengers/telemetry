@@ -20,7 +20,7 @@ The metrics bootstrap, the health probes and the tracing setup of a govengers se
 1. Configuration.
 2. `tracing.New`, then `otel.SetTracerProvider` and `otel.SetTextMapPropagator(propagation.TraceContext{})`. A startup failure of `New` (an unsupported protocol) stops the boot before anything listens.
 3. `telemetry.NewRegistry`, passed to every component with metrics.
-4. Clients, pool, Redis, with their instrumentation: `poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())` before the pool is built, `pgxadapter.NewPoolCollector` on the registry right after it, one per pool with its own `Name`.
+4. Clients, pool, Redis, with their instrumentation: one `tracer := pgxadapter.NewTracer()`, then `poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), tracer)` for every pool before it is built, `pgxadapter.NewPoolCollector` on the registry right after it, one per pool with its own `Name`.
 5. `health.New` with a check per dependency the pod cannot serve without (`pool.Ping`, the Redis ping).
 6. The Gin engine: `otelgin.Middleware`, the recovery, the wide-event middleware with the `RecordTraceID` pre-enricher, `ginadapter.NewMetricsMiddleware`, then `ginadapter.RegisterHealthRoutes` at the root before the authentication middleware, then the routes.
 7. `telemetry.NewMetricsServer` next to the API server.
@@ -57,7 +57,8 @@ err := errors.Join(apiServer.Shutdown(shutdownContext), metricsServer.Shutdown(s
 - **Readiness body.** It is unauthenticated, so it names the checks and never carries their errors (hostnames, addresses). Record the error through `OnCheckFailure`, which runs once per evaluation, not once per probe, and can run in two evaluations at the same time.
 - **pgxadapter is a module of its own.** `go get github.com/govengers/telemetry/pgxadapter`; it is tagged `pgxadapter/vX.Y.Z` and requires pgx v5.12.0 or newer.
 - **The database fields need the event in the statement's context.** The Gin middleware and the jobs middleware put it there; a repository that runs its statements with `context.Background()` or a context it built itself records nothing. Work detached with `context.WithoutCancel` keeps the event, and its statements that end after the event was emitted are dropped.
-- **One tracer, several pools.** The fields add up every pool's statements of a unit of work. The pool label separates only the pool metrics.
+- **One tracer, several pools.** Build the tracer once in main and give the same one to every pool. The fields then add up every pool's statements of a unit of work; the pool label separates only the pool metrics. A second tracer does not add up: the pool whose statement ends last overwrites the other's totals, because the totals live in the tracer.
+- **A failed acquire is a failure, not a statement.** When no pool connection comes (pool exhausted until the deadline, connection refused, context already ended) the event gets `db.failure` with `db.queries` 0.
 - **db.duration_ms is not wall time.** It is the sum of the statements' times: statements run concurrently add up, and a query's time includes reading its rows until `Close`.
 - **Redis statements.** `redisotel` records the whole command, keys and values, unless `redisotel.WithDBStatement(false)`.
 - **No OpenTelemetry meter provider.** The contrib instrumentations record OpenTelemetry metrics through the global meter provider; leaving it unset keeps them off. Prometheus is the metrics pipeline.

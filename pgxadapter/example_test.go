@@ -36,12 +36,14 @@ func ExampleNewTracer() {
 		fmt.Println(err)
 		return
 	}
-	// With traces: multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())
-	poolConfig.ConnConfig.Tracer = multitracer.New(pgxadapter.NewTracer())
+	tracer := pgxadapter.NewTracer() // once in main, the same one for every pool
+	// With traces: multitracer.New(otelpgx.NewTracer(), tracer)
+	poolConfig.ConnConfig.Tracer = multitracer.New(tracer)
 
 	// pool, err := pgxpool.NewWithConfig(ctx, poolConfig): every statement run in a context with a
 	// wide event (wideevent.FromContext) adds to its db.queries, db.duration_ms and db.slowest_ms
 	_, isBatchTracer := poolConfig.ConnConfig.Tracer.(pgx.BatchTracer)
-	fmt.Println(isBatchTracer)
-	// Output: true
+	_, isAcquireTracer := poolConfig.ConnConfig.Tracer.(pgxpool.AcquireTracer)
+	fmt.Println(isBatchTracer, isAcquireTracer)
+	// Output: true true
 }

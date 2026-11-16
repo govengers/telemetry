@@ -5,7 +5,8 @@
 // The package is a module of its own, github.com/govengers/telemetry/pgxadapter, so the
 // telemetry module stays free of pgx. In main:
 //
-//	poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())
+//	tracer := pgxadapter.NewTracer() // one for every pool
+//	poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), tracer)
 //	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 //	...
 //	pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
