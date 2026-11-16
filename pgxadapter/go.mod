@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/govengers/wide-event-logger v1.0.0
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/goleak v1.3.0
