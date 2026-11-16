@@ -1,13 +1,17 @@
-// Package pgxadapter exports the statistics of a pgx connection pool (pgxpool.Pool.Stat) as
-// Prometheus metrics, read at scrape time (standards MET-006).
+// Package pgxadapter instruments a pgx connection pool (github.com/jackc/pgx/v5): Tracer
+// records the database work of each unit of work on its wide event, and NewPoolCollector exports
+// the pool's statistics as Prometheus metrics, read at scrape time (standards MET-006).
 //
-// The package does not import pgx: it reads the pool through the Stat interface, which
-// *pgxpool.Stat implements, so the telemetry module stays free of the driver and a service
-// passes the pool in with one closure:
+// The package is a module of its own, github.com/govengers/telemetry/pgxadapter, so the
+// telemetry module stays free of pgx. In main:
 //
+//	poolConfig.ConnConfig.Tracer = multitracer.New(otelpgx.NewTracer(), pgxadapter.NewTracer())
+//	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+//	...
 //	pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
 //	    Registerer: registry,
 //	    Namespace:  "billing",
+//	    Name:       "main",
 //	    Stat:       func() pgxadapter.Stat { return pool.Stat() },
 //	})
 package pgxadapter
@@ -20,9 +24,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const subsystem = "db_pool"
+const (
+	subsystem = "db_pool"
+	poolLabel = "pool"
+)
 
-// Stat is the part of *pgxpool.Stat (github.com/jackc/pgx/v5/pgxpool) the collector reads.
+// Stat is the part of *pgxpool.Stat the collector reads.
 type Stat interface {
 	AcquireCount() int64
 	AcquireDuration() time.Duration
@@ -39,6 +46,10 @@ type Stat interface {
 type PoolOptions struct {
 	Registerer prometheus.Registerer // required; the service's registry, never the default one
 	Namespace  string                // required: the service name, e.g. "billing" for billing_db_pool_connections
+	// Name names the pool in the constant pool label of every metric; required, e.g. "main".
+	// Each pool of a service registers its own collector under the same Namespace and its
+	// own Name.
+	Name string
 	// Stat returns a snapshot of the pool's statistics; required. It is called once per
 	// scrape: func() pgxadapter.Stat { return pool.Stat() }.
 	Stat func() Stat
@@ -63,9 +74,10 @@ const (
 	StateConstructing = "constructing"
 )
 
-// NewPoolCollector registers a collector on options.Registerer that exports, at every scrape:
+// NewPoolCollector registers a collector on options.Registerer that exports, at every scrape,
+// each metric with the constant label pool="<options.Name>":
 //
-//	<namespace>_db_pool_connections{state}               gauge: acquired, idle, constructing
+//	<namespace>_db_pool_connections{pool,state}          gauge: acquired, idle, constructing
 //	<namespace>_db_pool_max_connections                  gauge: the pool's MaxConns
 //	<namespace>_db_pool_acquires_total                   successful acquires
 //	<namespace>_db_pool_acquire_duration_seconds_total   time spent in successful acquires
@@ -74,7 +86,7 @@ const (
 //	<namespace>_db_pool_canceled_acquires_total          acquires canceled by their context
 //
 // The registration error is returned, wrapping the registry's (prometheus.AlreadyRegisteredError
-// for a second pool under the same namespace).
+// for a second collector with the same Namespace and Name).
 func NewPoolCollector(options *PoolOptions) (*PoolCollector, error) {
 	if options == nil || options.Registerer == nil {
 		return nil, errors.New("telemetry pgxadapter: Registerer is required")
@@ -82,11 +94,15 @@ func NewPoolCollector(options *PoolOptions) (*PoolCollector, error) {
 	if options.Namespace == "" {
 		return nil, errors.New("telemetry pgxadapter: Namespace is required")
 	}
+	if options.Name == "" {
+		return nil, errors.New("telemetry pgxadapter: Name is required")
+	}
 	if options.Stat == nil {
 		return nil, errors.New("telemetry pgxadapter: Stat is required")
 	}
+	constantLabels := prometheus.Labels{poolLabel: options.Name}
 	describe := func(name, help string, labels ...string) *prometheus.Desc {
-		return prometheus.NewDesc(prometheus.BuildFQName(options.Namespace, subsystem, name), help, labels, nil)
+		return prometheus.NewDesc(prometheus.BuildFQName(options.Namespace, subsystem, name), help, labels, constantLabels)
 	}
 	collector := &PoolCollector{
 		stat:                options.Stat,
@@ -99,7 +115,7 @@ func NewPoolCollector(options *PoolOptions) (*PoolCollector, error) {
 		canceledAcquires:    describe("canceled_acquires_total", "Acquires canceled by their context."),
 	}
 	if err := options.Registerer.Register(collector); err != nil {
-		return nil, fmt.Errorf("telemetry pgxadapter: register the %s pool metrics: %w", options.Namespace, err)
+		return nil, fmt.Errorf("telemetry pgxadapter: register the metrics of the %s pool %q: %w", options.Namespace, options.Name, err)
 	}
 	return collector, nil
 }

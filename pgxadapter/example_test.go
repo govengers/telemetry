@@ -15,6 +15,7 @@ func ExampleNewPoolCollector() {
 	_, err := pgxadapter.NewPoolCollector(&pgxadapter.PoolOptions{
 		Registerer: registry,
 		Namespace:  "billing",
+		Name:       "main",
 		Stat:       func() pgxadapter.Stat { return pool }, // in main: return pool.Stat()
 	})
 	if err != nil {
